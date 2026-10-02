@@ -1,0 +1,4 @@
+test-data/
+test-backups/
+*.tar.gz
+*.tar.lzma
