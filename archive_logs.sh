@@ -30,3 +30,29 @@ printf 'Папка логов: %s\n' "$log_dir"
 printf 'Папка архивов: %s\n' "$backup_dir"
 printf 'Порог: %s%%\n' "$threshold"
 printf 'Лимит: %s МиБ\n' "$limit_mib"
+
+# Переводим лимит из МиБ в байты
+limit_bytes=$((limit_mib * 1024 * 1024))
+total_bytes=0
+
+# * включает и скрытые файлы; пустая папка не создаёт ложного имени
+shopt -s nullglob dotglob
+
+for file in "$log_dir"/*; do
+    # Учитываем только обычные файлы в этой папке
+    if [[ -f "$file" && ! -L "$file" ]]; then
+        file_bytes=$(wc -c < "$file")
+        total_bytes=$((total_bytes + file_bytes))
+    fi
+done
+
+percent=$((total_bytes * 100 / limit_bytes))
+
+printf 'Размер файлов: %s байт\n' "$total_bytes"
+printf 'Заполнение: %s%%\n' "$percent"
+
+if (( total_bytes * 100 > threshold * limit_bytes )); then
+    echo "Порог превышен: позже здесь будет архивирование"
+else
+    echo "Порог не превышен: архивирование не требуется"
+fi
