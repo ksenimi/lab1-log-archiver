@@ -34,6 +34,7 @@ printf 'Лимит: %s МиБ\n' "$limit_mib"
 # Переводим лимит из МиБ в байты
 limit_bytes=$((limit_mib * 1024 * 1024))
 total_bytes=0
+oldest_file=""
 
 # * включает и скрытые файлы; пустая папка не создаёт ложного имени
 shopt -s nullglob dotglob
@@ -43,6 +44,10 @@ for file in "$log_dir"/*; do
     if [[ -f "$file" && ! -L "$file" ]]; then
         file_bytes=$(wc -c < "$file")
         total_bytes=$((total_bytes + file_bytes))
+
+        if [[ -z "$oldest_file" || "$file" -ot "$oldest_file" ]]; then
+            oldest_file=$file
+        fi
     fi
 done
 
@@ -53,6 +58,7 @@ printf 'Заполнение: %s%%\n' "$percent"
 
 if (( total_bytes * 100 > threshold * limit_bytes )); then
     echo "Порог превышен: позже здесь будет архивирование"
+    printf 'Самый старый файл: %s\n' "$oldest_file"
 else
     echo "Порог не превышен: архивирование не требуется"
 fi
