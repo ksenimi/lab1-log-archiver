@@ -43,7 +43,10 @@ shopt -s nullglob dotglob
 for file in "$log_dir"/*; do
     # Учитываем только обычные файлы в этой папке
     if [[ -f "$file" && ! -L "$file" ]]; then
-        file_bytes=$(wc -c < "$file")
+        if ! file_bytes=$(wc -c < "$file"); then
+            echo "Ошибка: не удалось прочитать файл: $file" >&2
+            exit 1
+        fi
         total_bytes=$((total_bytes + file_bytes))
         files+=("$file")
         sizes+=("$file_bytes")
@@ -114,6 +117,11 @@ if (( total_bytes * 100 > threshold * limit_bytes )); then
     if [[ ${LAB1_MAX_COMPRESSION:-} == 1 ]]; then
         compression_option=--lzma
         archive_extension=.tar.lzma
+        if ! command -v lzma >/dev/null 2>&1; then
+            rm -f -- "$archive_temp"
+            echo "Ошибка: для режима LZMA нужна команда lzma" >&2
+            exit 1
+        fi
     fi
     archive_file="$archive_temp$archive_extension"
     selected_names=()
@@ -128,9 +136,14 @@ if (( total_bytes * 100 > threshold * limit_bytes )); then
         echo "Ошибка: архив не создан; исходные файлы сохранены" >&2
         exit 1
     fi
-    if ! mv -- "$archive_temp" "$archive_file"; then
+    # Жёсткая ссылка создаёт итоговое имя, только если оно ещё не занято.
+    if ! ln -- "$archive_temp" "$archive_file"; then
         rm -f -- "$archive_temp"
-        echo "Ошибка: не удалось сохранить архив; исходные файлы сохранены" >&2
+        echo "Ошибка: не удалось сохранить архив без перезаписи; исходные файлы сохранены" >&2
+        exit 1
+    fi
+    if ! rm -- "$archive_temp"; then
+        echo "Ошибка: архив создан, но временный файл не удалён; исходные файлы сохранены" >&2
         exit 1
     fi
 
