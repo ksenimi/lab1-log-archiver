@@ -91,6 +91,51 @@ if (( total_bytes * 100 > threshold * limit_bytes )); then
     printf 'Порог превышен. Выбрано файлов: %s\n' "${#selected_files[@]}"
     printf 'Для архива: %s\n' "${selected_files[@]}"
     printf 'Размер после удаления исходников: %s байт\n' "$remaining_bytes"
+
+    if ! mkdir -p -- "$backup_dir"; then
+        echo "Ошибка: не удалось создать папку архивов: $backup_dir" >&2
+        exit 1
+    fi
+
+    log_abs=$(cd -- "$log_dir" && pwd -P) || exit 1
+    backup_abs=$(cd -- "$backup_dir" && pwd -P) || exit 1
+    if [[ "$backup_abs" == "$log_abs" || "$backup_abs" == "$log_abs/"* ]]; then
+        echo "Ошибка: папка архивов должна находиться вне папки логов" >&2
+        exit 1
+    fi
+
+    # mktemp создаёт уникальное имя, чтобы не перезаписать прежний архив.
+    archive_temp=$(mktemp "$backup_dir/logs_XXXXXXXX") || {
+        echo "Ошибка: не удалось подготовить файл архива" >&2
+        exit 1
+    }
+    archive_file="$archive_temp.tar.gz"
+    selected_names=()
+    for file in "${selected_files[@]}"; do
+        selected_names+=("${file##*/}")
+    done
+
+    # Пока tar не завершился успешно и архив не прочитан, исходники не трогаем.
+    if ! tar -czf "$archive_temp" -C "$log_dir" -- "${selected_names[@]}" ||
+       ! tar -tzf "$archive_temp" >/dev/null; then
+        rm -f -- "$archive_temp"
+        echo "Ошибка: архив не создан; исходные файлы сохранены" >&2
+        exit 1
+    fi
+    if ! mv -- "$archive_temp" "$archive_file"; then
+        rm -f -- "$archive_temp"
+        echo "Ошибка: не удалось сохранить архив; исходные файлы сохранены" >&2
+        exit 1
+    fi
+
+    printf 'Архив создан: %s\n' "$archive_file"
+    for file in "${selected_files[@]}"; do
+        if ! rm -- "$file"; then
+            echo "Ошибка: не удалось удалить исходный файл: $file" >&2
+            exit 1
+        fi
+    done
+    printf 'Удалено исходных файлов: %s\n' "${#selected_files[@]}"
 else
     echo "Порог не превышен: архивирование не требуется"
 fi
