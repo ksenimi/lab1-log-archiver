@@ -34,7 +34,8 @@ printf 'Лимит: %s МиБ\n' "$limit_mib"
 # Переводим лимит из МиБ в байты
 limit_bytes=$((limit_mib * 1024 * 1024))
 total_bytes=0
-oldest_file=""
+files=()
+sizes=()
 
 # * включает и скрытые файлы; пустая папка не создаёт ложного имени
 shopt -s nullglob dotglob
@@ -44,10 +45,8 @@ for file in "$log_dir"/*; do
     if [[ -f "$file" && ! -L "$file" ]]; then
         file_bytes=$(wc -c < "$file")
         total_bytes=$((total_bytes + file_bytes))
-
-        if [[ -z "$oldest_file" || "$file" -ot "$oldest_file" ]]; then
-            oldest_file=$file
-        fi
+        files+=("$file")
+        sizes+=("$file_bytes")
     fi
 done
 
@@ -57,8 +56,41 @@ printf 'Размер файлов: %s байт\n' "$total_bytes"
 printf 'Заполнение: %s%%\n' "$percent"
 
 if (( total_bytes * 100 > threshold * limit_bytes )); then
-    echo "Порог превышен: позже здесь будет архивирование"
-    printf 'Самый старый файл: %s\n' "$oldest_file"
+    # Сортируем файлы по времени изменения; при равной дате — по имени.
+    for ((i = 0; i < ${#files[@]}; i++)); do
+        oldest_index=$i
+        for ((j = i + 1; j < ${#files[@]}; j++)); do
+            candidate=${files[j]}
+            current=${files[oldest_index]}
+            if [[ "$candidate" -ot "$current" ]] ||
+               [[ ! "$candidate" -nt "$current" && "$candidate" < "$current" ]]; then
+                oldest_index=$j
+            fi
+        done
+        if (( oldest_index != i )); then
+            temp_file=${files[i]}
+            files[i]=${files[oldest_index]}
+            files[oldest_index]=$temp_file
+            temp_size=${sizes[i]}
+            sizes[i]=${sizes[oldest_index]}
+            sizes[oldest_index]=$temp_size
+        fi
+    done
+
+    # Берём минимальное число самых старых файлов для достижения порога.
+    selected_files=()
+    remaining_bytes=$total_bytes
+    for ((i = 0; i < ${#files[@]}; i++)); do
+        selected_files+=("${files[i]}")
+        remaining_bytes=$((remaining_bytes - sizes[i]))
+        if (( remaining_bytes * 100 <= threshold * limit_bytes )); then
+            break
+        fi
+    done
+
+    printf 'Порог превышен. Выбрано файлов: %s\n' "${#selected_files[@]}"
+    printf 'Для архива: %s\n' "${selected_files[@]}"
+    printf 'Размер после удаления исходников: %s байт\n' "$remaining_bytes"
 else
     echo "Порог не превышен: архивирование не требуется"
 fi
