@@ -109,15 +109,21 @@ if (( total_bytes * 100 > threshold * limit_bytes )); then
         echo "Ошибка: не удалось подготовить файл архива" >&2
         exit 1
     }
-    archive_file="$archive_temp.tar.gz"
+    compression_option=-z
+    archive_extension=.tar.gz
+    if [[ ${LAB1_MAX_COMPRESSION:-} == 1 ]]; then
+        compression_option=--lzma
+        archive_extension=.tar.lzma
+    fi
+    archive_file="$archive_temp$archive_extension"
     selected_names=()
     for file in "${selected_files[@]}"; do
         selected_names+=("${file##*/}")
     done
 
     # Пока tar не завершился успешно и архив не прочитан, исходники не трогаем.
-    if ! tar -czf "$archive_temp" -C "$log_dir" -- "${selected_names[@]}" ||
-       ! tar -tzf "$archive_temp" >/dev/null; then
+    if ! tar -c "$compression_option" -f "$archive_temp" -C "$log_dir" -- "${selected_names[@]}" ||
+       ! tar -t "$compression_option" -f "$archive_temp" >/dev/null; then
         rm -f -- "$archive_temp"
         echo "Ошибка: архив не создан; исходные файлы сохранены" >&2
         exit 1
