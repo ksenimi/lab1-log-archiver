@@ -83,20 +83,9 @@ if not defined ARCHIVE_PATH (
 )
 if exist "%ARCHIVE_PATH%" goto choose_archive_name
 echo Archive path: "%ARCHIVE_PATH%"
-powershell -NoProfile -Command "try { $files=@(Get-ChildItem -LiteralPath $env:LOG_DIR -Force -File -ErrorAction Stop | Where-Object { -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } | Sort-Object LastWriteTime, Name); $remaining=[bigint]0; foreach ($f in $files) { $remaining += [bigint]$f.Length }; $target=[bigint]$env:THRESHOLD * [bigint]$env:LIMIT_MIB * 1048576; $selected=New-Object 'System.Collections.Generic.List[string]'; foreach ($f in $files) { if ($remaining * 100 -le $target) { break }; [void]$selected.Add($f.Name); $remaining -= [bigint]$f.Length }; if ($selected.Count -eq 0) { throw 'No files selected' }; $names=$selected.ToArray(); if ($env:LAB1_MAX_COMPRESSION -eq '1') { & tar.exe --lzma -cf $env:ARCHIVE_PATH -C $env:LOG_DIR -- @names } else { & tar.exe -czf $env:ARCHIVE_PATH -C $env:LOG_DIR -- @names }; $tarCode=$LASTEXITCODE; if ($tarCode -ne 0) { Remove-Item -LiteralPath $env:ARCHIVE_PATH -Force -ErrorAction SilentlyContinue; throw ('tar failed with code {0}' -f $tarCode) }; Write-Output ('Archive created: {0}' -f $env:ARCHIVE_PATH) } catch { Write-Error $_; exit 1 }"
+powershell -NoProfile -Command "try { $archiveReady=$false; $files=@(Get-ChildItem -LiteralPath $env:LOG_DIR -Force -File -ErrorAction Stop | Where-Object { -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } | Sort-Object LastWriteTime, Name); $remaining=[bigint]0; foreach ($f in $files) { $remaining += [bigint]$f.Length }; $target=[bigint]$env:THRESHOLD * [bigint]$env:LIMIT_MIB * 1048576; $selected=New-Object 'System.Collections.Generic.List[System.IO.FileInfo]'; foreach ($f in $files) { if ($remaining * 100 -le $target) { break }; [void]$selected.Add($f); $remaining -= [bigint]$f.Length }; if ($selected.Count -eq 0) { throw 'No files selected' }; $names=[string[]]@($selected | ForEach-Object { $_.Name }); if ($env:LAB1_MAX_COMPRESSION -eq '1') { & tar.exe --lzma -cf $env:ARCHIVE_PATH -C $env:LOG_DIR -- @names } else { & tar.exe -czf $env:ARCHIVE_PATH -C $env:LOG_DIR -- @names }; if ($LASTEXITCODE -ne 0) { throw ('tar failed with code {0}' -f $LASTEXITCODE) }; $archive=Get-Item -LiteralPath $env:ARCHIVE_PATH -ErrorAction Stop; if ($archive.Length -eq 0) { throw 'Archive is empty' }; & tar.exe -tf $env:ARCHIVE_PATH | Out-Null; if ($LASTEXITCODE -ne 0) { throw 'Archive cannot be read' }; $archiveReady=$true; Write-Output ('Archive created and checked: {0}' -f $env:ARCHIVE_PATH); foreach ($f in $selected) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; Write-Output ('Deleted: {0}' -f $f.Name) } } catch { if (-not $archiveReady -and (Test-Path -LiteralPath $env:ARCHIVE_PATH)) { Remove-Item -LiteralPath $env:ARCHIVE_PATH -Force -ErrorAction SilentlyContinue }; Write-Error $_; exit 1 }"
 if errorlevel 1 (
-    echo Error: archive creation failed. Original files were kept.
-    exit /b 1
-)
-tar.exe -tf "%ARCHIVE_PATH%" >nul
-if errorlevel 1 (
-    echo Error: archive cannot be read. Original files were kept.
-    exit /b 1
-)
-echo Archive is readable.
-powershell -NoProfile -Command "try { $names=@(& tar.exe -tf $env:ARCHIVE_PATH); if ($LASTEXITCODE -ne 0 -or $names.Count -eq 0) { throw 'Archive is unreadable or empty' }; foreach ($name in $names) { if ([string]::IsNullOrWhiteSpace($name) -or $name -eq '.' -or $name -eq '..' -or $name -ne [IO.Path]::GetFileName($name)) { throw ('Unsafe archive entry: {0}' -f $name) }; $item=Get-Item -LiteralPath (Join-Path $env:LOG_DIR $name) -Force -ErrorAction Stop; if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw ('Not a regular file: {0}' -f $name) } }; foreach ($name in $names) { Remove-Item -LiteralPath (Join-Path $env:LOG_DIR $name) -Force -ErrorAction Stop; Write-Output ('Deleted: {0}' -f $name) } } catch { Write-Error $_; exit 1 }"
-if errorlevel 1 (
-    echo Error: could not safely remove source files. Archive was kept.
+    echo Error: archiving failed.
     exit /b 1
 )
 echo Log folder: "%LOG_DIR%"
