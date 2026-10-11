@@ -16,6 +16,10 @@ trap 'rm -rf "$TEST_ROOT"' EXIT
 PASSED=0
 FAILED=0
 
+# Общий лимит для тестов
+LIMIT_MIB=600
+LIMIT_BYTES=$((LIMIT_MIB * 1024 * 1024))
+
 
 # ==================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -39,8 +43,8 @@ create_test_environment() {
 
     rm -rf "$LOG_DIR" "$BACKUP_DIR"
 
-    mkdir -p "$LOG_DIR"
-    mkdir -p "$BACKUP_DIR"
+    mkdir -p "$LOG_DIR" || return 1
+    mkdir -p "$BACKUP_DIR" || return 1
 }
 
 
@@ -53,15 +57,76 @@ create_file() {
 }
 
 
-# Найти созданный обычный архив
-find_gz_archive() {
-    find "$BACKUP_DIR" -maxdepth 1 -type f -name "*.tar.gz" -print -quit
+# Посчитать размер обычных файлов непосредственно в папке.
+# Это та же модель размера, которая используется в основном скрипте.
+get_log_size_bytes() {
+    local total=0
+    local file
+    local size
+
+    shopt -s nullglob dotglob
+
+    for file in "$LOG_DIR"/*; do
+        if [[ -f "$file" && ! -L "$file" ]]; then
+            size=$(wc -c < "$file") || return 1
+            total=$((total + size))
+        fi
+    done
+
+    echo "$total"
 }
 
 
-# Найти созданный LZMA-архив
-find_lzma_archive() {
-    find "$BACKUP_DIR" -maxdepth 1 -type f -name "*.tar.lzma" -print -quit
+# Найти обычные tar.gz архивы
+find_gz_archives() {
+    find "$BACKUP_DIR" -maxdepth 1 -type f -name "*.tar.gz" -print
+}
+
+
+# Найти обычные tar.lzma архивы
+find_lzma_archives() {
+    find "$BACKUP_DIR" -maxdepth 1 -type f -name "*.tar.lzma" -print
+}
+
+
+# Проверить, что существует ровно один обычный архив
+get_single_gz_archive() {
+    local archives
+    local count
+
+    archives="$(find_gz_archives)"
+    count="$(printf '%s\n' "$archives" | sed '/^$/d' | wc -l)"
+
+    if [ "$count" -eq 1 ]; then
+        printf '%s\n' "$archives"
+        return 0
+    fi
+
+    return 1
+}
+
+
+# Проверить, что существует ровно один LZMA-архив
+get_single_lzma_archive() {
+    local archives
+    local count
+
+    archives="$(find_lzma_archives)"
+    count="$(printf '%s\n' "$archives" | sed '/^$/d' | wc -l)"
+
+    if [ "$count" -eq 1 ]; then
+        printf '%s\n' "$archives"
+        return 0
+    fi
+
+    return 1
+}
+
+
+# Запустить основной скрипт и сохранить его код завершения
+run_archiver() {
+    "$@" >/dev/null 2>&1
+    return $?
 }
 
 
@@ -86,31 +151,39 @@ echo
 
 # ==================================================
 # ТЕСТ 1
-# Порог НЕ превышен
+# Порог не превышен
 # ==================================================
 
 echo "Тест 1: порог не превышен"
 
-create_test_environment
-
-# Всего 520 МиБ.
-# Лимит 600 МиБ.
-# 520 / 600 = 86,6%.
-# При пороге 90% архивирование происходить не должно.
-create_file "$LOG_DIR/file1.log" 260
-create_file "$LOG_DIR/file2.log" 260
-
-bash "$ARCHIVER" "$LOG_DIR" "$BACKUP_DIR" 90 600 >/dev/null
-
-ARCHIVE="$(find_gz_archive)"
-
-if [ -z "$ARCHIVE" ] &&
-   [ -f "$LOG_DIR/file1.log" ] &&
-   [ -f "$LOG_DIR/file2.log" ]; then
-
-    pass_test "при непревышенном пороге архив не создаётся"
+if ! create_test_environment; then
+    fail_test "не удалось подготовить тестовую среду"
 else
-    fail_test "при непревышенном пороге произошло архивирование"
+    # 520 МиБ из лимита 600 МиБ = 86,6%.
+    # При пороге 90% архивирование происходить не должно.
+    create_file "$LOG_DIR/file1.log" 260
+    create_file "$LOG_DIR/file2.log" 260
+
+    THRESHOLD=90
+    TARGET_BYTES=$((THRESHOLD * LIMIT_BYTES / 100))
+
+    run_archiver bash "$ARCHIVER" "$LOG_DIR" "$BACKUP_DIR" "$THRESHOLD" "$LIMIT_MIB"
+    RESULT=$?
+
+    ARCHIVE_COUNT="$(find_gz_archives | sed '/^$/d' | wc -l)"
+    LOG_SIZE="$(get_log_size_bytes)"
+
+    if [ "$RESULT" -eq 0 ] &&
+       [ "$ARCHIVE_COUNT" -eq 0 ] &&
+       [ -f "$LOG_DIR/file1.log" ] &&
+       [ -f "$LOG_DIR/file2.log" ] &&
+       [ "$LOG_SIZE" -eq $((520 * 1024 * 1024)) ] &&
+       [ "$LOG_SIZE" -le "$TARGET_BYTES" ]; then
+
+        pass_test "при непревышенном пороге архив не создаётся, файлы остаются, код возврата 0"
+    else
+        fail_test "при непревышенном пороге результат или код возврата неправильные"
+    fi
 fi
 
 
@@ -122,138 +195,188 @@ fi
 echo
 echo "Тест 2: порог превышен"
 
-create_test_environment
-
-# 600 МиБ из лимита 600 МиБ = 100%.
-# При пороге 70% архивирование должно произойти.
-create_file "$LOG_DIR/file1.log" 300
-create_file "$LOG_DIR/file2.log" 300
-
-bash "$ARCHIVER" "$LOG_DIR" "$BACKUP_DIR" 70 600 >/dev/null
-
-ARCHIVE="$(find_gz_archive)"
-
-if [ -n "$ARCHIVE" ] &&
-   { [ ! -f "$LOG_DIR/file1.log" ] || [ ! -f "$LOG_DIR/file2.log" ]; } &&
-   tar -tzf "$ARCHIVE" >/dev/null 2>&1; then
-
-    pass_test "при превышении порога создаётся корректный архив и исходные файлы удаляются"
+if ! create_test_environment; then
+    fail_test "не удалось подготовить тестовую среду"
 else
-    fail_test "архивирование при превышении порога работает неправильно"
+    # 600 МиБ из лимита 600 МиБ = 100%.
+    # При пороге 70% нужно уменьшить размер до 420 МиБ или меньше.
+    #
+    # Два файла по 300 МиБ.
+    # Для достижения порога достаточно удалить один файл.
+    create_file "$LOG_DIR/file1.log" 300
+    create_file "$LOG_DIR/file2.log" 300
+
+    THRESHOLD=70
+    TARGET_BYTES=$((THRESHOLD * LIMIT_BYTES / 100))
+
+    run_archiver bash "$ARCHIVER" "$LOG_DIR" "$BACKUP_DIR" "$THRESHOLD" "$LIMIT_MIB"
+    RESULT=$?
+
+    ARCHIVE="$(get_single_gz_archive)"
+    LOG_SIZE="$(get_log_size_bytes)"
+
+    # Определяем, какой из двух файлов был удалён
+    REMOVED_FILE=""
+
+    if [ ! -f "$LOG_DIR/file1.log" ] &&
+       [ -f "$LOG_DIR/file2.log" ]; then
+        REMOVED_FILE="file1.log"
+    elif [ -f "$LOG_DIR/file1.log" ] &&
+         [ ! -f "$LOG_DIR/file2.log" ]; then
+        REMOVED_FILE="file2.log"
+    fi
+
+    # Проверяем, что архив действительно содержит удалённый файл
+    ARCHIVE_CONTAINS_REMOVED_FILE=0
+
+    if [ -n "$ARCHIVE" ] && [ -n "$REMOVED_FILE" ] &&
+       tar -tzf "$ARCHIVE" 2>/dev/null | grep -Fxq "$REMOVED_FILE"; then
+        ARCHIVE_CONTAINS_REMOVED_FILE=1
+    fi
+
+    if [ "$RESULT" -eq 0 ] &&
+       [ -n "$ARCHIVE" ] &&
+       tar -tzf "$ARCHIVE" >/dev/null 2>&1 &&
+       [ -n "$REMOVED_FILE" ] &&
+       [ "$ARCHIVE_CONTAINS_REMOVED_FILE" -eq 1 ] &&
+       [ "$LOG_SIZE" -le "$TARGET_BYTES" ]; then
+
+        pass_test "при превышении порога создаётся корректный архив, удалённый файл сохранён в архиве, размер уменьшается до порога, код возврата 0"
+    else
+        fail_test "архивирование при превышении порога работает неправильно"
+    fi
 fi
 
 
 # ==================================================
 # ТЕСТ 3
-# Самые старые файлы выбираются первыми
+# Другой порог меняет результат
 # ==================================================
 
 echo
-echo "Тест 3: выбираются самые старые файлы"
+echo "Тест 3: используется переданный порог"
 
-create_test_environment
-
-# Всего 600 МиБ.
-create_file "$LOG_DIR/old.log" 100
-create_file "$LOG_DIR/middle.log" 100
-create_file "$LOG_DIR/new.log" 100
-create_file "$LOG_DIR/big.log" 300
-
-# Устанавливаем разные даты изменения.
-touch -d "2020-01-01 10:00:00" "$LOG_DIR/old.log"
-touch -d "2021-01-01 10:00:00" "$LOG_DIR/middle.log"
-touch -d "2022-01-01 10:00:00" "$LOG_DIR/new.log"
-touch -d "2023-01-01 10:00:00" "$LOG_DIR/big.log"
-
-bash "$ARCHIVER" "$LOG_DIR" "$BACKUP_DIR" 70 600 >/dev/null
-
-ARCHIVE="$(find_gz_archive)"
-
-# Чтобы опуститься с 600 МиБ до 70% от 600 МиБ,
-# нужно оставить максимум 420 МиБ.
-#
-# Скрипт должен выбрать:
-# old.log    100 МиБ
-# middle.log 100 МиБ
-#
-# После их удаления останется 400 МиБ.
-if [ -n "$ARCHIVE" ] &&
-   [ ! -f "$LOG_DIR/old.log" ] &&
-   [ ! -f "$LOG_DIR/middle.log" ] &&
-   [ -f "$LOG_DIR/new.log" ] &&
-   [ -f "$LOG_DIR/big.log" ] &&
-   tar -tzf "$ARCHIVE" | grep -q "old.log" &&
-   tar -tzf "$ARCHIVE" | grep -q "middle.log" &&
-   ! tar -tzf "$ARCHIVE" | grep -q "new.log" &&
-   ! tar -tzf "$ARCHIVE" | grep -q "big.log"; then
-
-    pass_test "архивируются самые старые файлы"
+if ! create_test_environment; then
+    fail_test "не удалось подготовить тестовую среду"
 else
-    fail_test "выбраны неправильные файлы для архива"
+    # Те же исходные данные, что в тесте 1:
+    # 520 МиБ из 600 МиБ = 86,6%.
+    # В тесте 1 порог 90% — архивирования нет.
+    # Здесь порог 80% — архивирование должно произойти.
+    create_file "$LOG_DIR/file1.log" 260
+    create_file "$LOG_DIR/file2.log" 260
+
+    THRESHOLD=80
+    TARGET_BYTES=$((THRESHOLD * LIMIT_BYTES / 100))
+
+    run_archiver bash "$ARCHIVER" "$LOG_DIR" "$BACKUP_DIR" "$THRESHOLD" "$LIMIT_MIB"
+    RESULT=$?
+
+    ARCHIVE="$(get_single_gz_archive)"
+    LOG_SIZE="$(get_log_size_bytes)"
+
+    if [ -n "$ARCHIVE" ] &&
+       [ "$RESULT" -eq 0 ] &&
+       tar -tzf "$ARCHIVE" >/dev/null 2>&1 &&
+       [ "$LOG_SIZE" -le "$TARGET_BYTES" ] &&
+       { [ ! -f "$LOG_DIR/file1.log" ] || [ ! -f "$LOG_DIR/file2.log" ]; } &&
+       tar -tzf "$ARCHIVE" | grep -qE '(^|/)file[12]\.log$'; then
+
+        pass_test "изменение порога действительно меняет результат для одинаковых исходных данных"
+    else
+        fail_test "скрипт не использует переданный порог правильно"
+    fi
 fi
 
 
 # ==================================================
 # ТЕСТ 4
-# Переданный порог действительно используется
+# Самые старые файлы выбираются первыми
 # ==================================================
 
 echo
-echo "Тест 4: используется переданный порог"
+echo "Тест 4: выбираются самые старые файлы"
 
-create_test_environment
-
-# 520 МиБ из 600 МиБ = 86,6%.
-#
-# Если передать 90%, архивирования быть не должно.
-# Это проверяет, что скрипт действительно использует
-# переданный порог, а не всегда 70%.
-create_file "$LOG_DIR/file1.log" 260
-create_file "$LOG_DIR/file2.log" 260
-
-bash "$ARCHIVER" "$LOG_DIR" "$BACKUP_DIR" 90 600 >/dev/null
-
-ARCHIVE="$(find_gz_archive)"
-
-if [ -z "$ARCHIVE" ] &&
-   [ -f "$LOG_DIR/file1.log" ] &&
-   [ -f "$LOG_DIR/file2.log" ]; then
-
-    pass_test "переданный порог 90% используется правильно"
+if ! create_test_environment; then
+    fail_test "не удалось подготовить тестовую среду"
 else
-    fail_test "скрипт не использует переданный порог"
+    # Всего 600 МиБ.
+    create_file "$LOG_DIR/old.log" 100
+    create_file "$LOG_DIR/middle.log" 100
+    create_file "$LOG_DIR/new.log" 100
+    create_file "$LOG_DIR/big.log" 300
+
+    # Устанавливаем разные даты изменения
+    touch -d "2020-01-01 10:00:00" "$LOG_DIR/old.log"
+    touch -d "2021-01-01 10:00:00" "$LOG_DIR/middle.log"
+    touch -d "2022-01-01 10:00:00" "$LOG_DIR/new.log"
+    touch -d "2023-01-01 10:00:00" "$LOG_DIR/big.log"
+
+    THRESHOLD=70
+    TARGET_BYTES=$((THRESHOLD * LIMIT_BYTES / 100))
+
+    run_archiver bash "$ARCHIVER" "$LOG_DIR" "$BACKUP_DIR" "$THRESHOLD" "$LIMIT_MIB"
+    RESULT=$?
+
+    ARCHIVE="$(get_single_gz_archive)"
+    LOG_SIZE="$(get_log_size_bytes)"
+
+    if [ -n "$ARCHIVE" ] &&
+       [ "$RESULT" -eq 0 ] &&
+       tar -tzf "$ARCHIVE" >/dev/null 2>&1 &&
+       [ "$LOG_SIZE" -le "$TARGET_BYTES" ] &&
+       [ ! -f "$LOG_DIR/old.log" ] &&
+       [ ! -f "$LOG_DIR/middle.log" ] &&
+       [ -f "$LOG_DIR/new.log" ] &&
+       [ -f "$LOG_DIR/big.log" ] &&
+       tar -tzf "$ARCHIVE" | grep -qE '(^|/)old\.log$' &&
+       tar -tzf "$ARCHIVE" | grep -qE '(^|/)middle\.log$' &&
+       ! tar -tzf "$ARCHIVE" | grep -qE '(^|/)new\.log$' &&
+       ! tar -tzf "$ARCHIVE" | grep -qE '(^|/)big\.log$'; then
+
+        pass_test "архивируются самые старые файлы, новые остаются, размер после удаления не превышает порог"
+    else
+        fail_test "выбраны неправильные файлы для архива"
+    fi
 fi
 
 
 # ==================================================
 # ТЕСТ 5
-# Ошибка при создании папки архивов
+# Ошибка подготовки папки архивов
 # ==================================================
 
 echo
-echo "Тест 5: ошибка архивирования"
+echo "Тест 5: ошибка подготовки папки архивов"
 
-create_test_environment
-
-create_file "$LOG_DIR/file1.log" 300
-create_file "$LOG_DIR/file2.log" 300
-
-# Создаём файл с таким именем.
-# Скрипт попытается использовать его как папку архивов,
-# но создать папку с таким именем не сможет.
-BAD_BACKUP="$TEST_ROOT/not_a_directory"
-touch "$BAD_BACKUP"
-
-bash "$ARCHIVER" "$LOG_DIR" "$BAD_BACKUP" 70 600 >/dev/null 2>&1
-RESULT=$?
-
-if [ "$RESULT" -ne 0 ] &&
-   [ -f "$LOG_DIR/file1.log" ] &&
-   [ -f "$LOG_DIR/file2.log" ]; then
-
-    pass_test "при ошибке архивирования исходные файлы сохраняются"
+if ! create_test_environment; then
+    fail_test "не удалось подготовить тестовую среду"
 else
-    fail_test "при ошибке архивирования исходные файлы были удалены"
+    # 600 МиБ — порог 70% превышен.
+    create_file "$LOG_DIR/file1.log" 300
+    create_file "$LOG_DIR/file2.log" 300
+
+    # Создаём обычный файл вместо папки архивов.
+    # mkdir -p не сможет создать каталог поверх существующего файла.
+    INVALID_BACKUP_PATH="$TEST_ROOT/not_a_directory"
+    : > "$INVALID_BACKUP_PATH"
+
+    THRESHOLD=70
+    run_archiver bash "$ARCHIVER" "$LOG_DIR" "$INVALID_BACKUP_PATH" "$THRESHOLD" "$LIMIT_MIB"
+    RESULT=$?
+
+    LOG_SIZE="$(get_log_size_bytes)"
+
+    if [ "$RESULT" -ne 0 ] &&
+       [ "$LOG_SIZE" -eq $((600 * 1024 * 1024)) ] &&
+       [ -f "$LOG_DIR/file1.log" ] &&
+       [ -f "$LOG_DIR/file2.log" ] &&
+       [ -f "$INVALID_BACKUP_PATH" ]; then
+
+        pass_test "при ошибке подготовки папки архивов исходные файлы сохраняются и возвращается код ошибки"
+    else
+        fail_test "при ошибке подготовки папки архивов результат неправильный"
+    fi
 fi
 
 
@@ -265,22 +388,37 @@ fi
 echo
 echo "Тест 6: LZMA"
 
-create_test_environment
-
-create_file "$LOG_DIR/file1.log" 300
-create_file "$LOG_DIR/file2.log" 300
-
-LAB1_MAX_COMPRESSION=1 \
-    bash "$ARCHIVER" "$LOG_DIR" "$BACKUP_DIR" 70 600 >/dev/null
-
-LZMA_ARCHIVE="$(find_lzma_archive)"
-
-if [ -n "$LZMA_ARCHIVE" ] &&
-   tar -t --lzma -f "$LZMA_ARCHIVE" >/dev/null 2>&1; then
-
-    pass_test "LZMA-архив создан и читается"
+if ! create_test_environment; then
+    fail_test "не удалось подготовить тестовую среду"
 else
-    fail_test "LZMA-архив не создан или повреждён"
+    # 600 МиБ — порог 70% превышен.
+    create_file "$LOG_DIR/file1.log" 300
+    create_file "$LOG_DIR/file2.log" 300
+
+    if ! command -v lzma >/dev/null 2>&1; then
+        fail_test "команда lzma не установлена"
+    else
+        THRESHOLD=70
+        TARGET_BYTES=$((THRESHOLD * LIMIT_BYTES / 100))
+
+        LAB1_MAX_COMPRESSION=1 \
+            run_archiver bash "$ARCHIVER" "$LOG_DIR" "$BACKUP_DIR" "$THRESHOLD" "$LIMIT_MIB"
+        RESULT=$?
+
+        LZMA_ARCHIVE="$(get_single_lzma_archive)"
+        LOG_SIZE="$(get_log_size_bytes)"
+
+        if [ -n "$LZMA_ARCHIVE" ] &&
+           [ "$RESULT" -eq 0 ] &&
+           tar -t --lzma -f "$LZMA_ARCHIVE" >/dev/null 2>&1 &&
+           [ "$LOG_SIZE" -le "$TARGET_BYTES" ] &&
+           { [ ! -f "$LOG_DIR/file1.log" ] || [ ! -f "$LOG_DIR/file2.log" ]; }; then
+
+            pass_test "LZMA-архив создан, читается, исходная папка уменьшена до порога, код возврата 0"
+        else
+            fail_test "LZMA-архив не создан или работает неправильно"
+        fi
+    fi
 fi
 
 
