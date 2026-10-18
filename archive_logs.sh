@@ -26,6 +26,13 @@ if [[ ! $limit_mib =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 
+# Используем абсолютный путь, чтобы относительные пути внутри архива
+# сохраняли структуру подпапок независимо от способа запуска.
+log_dir=$(cd -- "$log_dir" && pwd -P) || {
+    echo "Ошибка: не удалось открыть папку логов" >&2
+    exit 1
+}
+
 printf 'Папка логов: %s\n' "$log_dir"
 printf 'Папка архивов: %s\n' "$backup_dir"
 printf 'Порог: %s%%\n' "$threshold"
@@ -37,21 +44,28 @@ total_bytes=0
 files=()
 sizes=()
 
-# * включает и скрытые файлы; пустая папка не создаёт ложного имени
-shopt -s nullglob dotglob
+# find обходит все подпапки; -print0 сохраняет имена с пробелами и переводами строк.
+scan_list=$(mktemp) || {
+    echo "Ошибка: не удалось подготовить список файлов" >&2
+    exit 1
+}
+if ! find "$log_dir" -type f -print0 > "$scan_list"; then
+    rm -f -- "$scan_list"
+    echo "Ошибка: не удалось прочитать дерево папки логов" >&2
+    exit 1
+fi
 
-for file in "$log_dir"/*; do
-    # Учитываем только обычные файлы в этой папке
-    if [[ -f "$file" && ! -L "$file" ]]; then
-        if ! file_bytes=$(wc -c < "$file"); then
-            echo "Ошибка: не удалось прочитать файл: $file" >&2
-            exit 1
-        fi
-        total_bytes=$((total_bytes + file_bytes))
-        files+=("$file")
-        sizes+=("$file_bytes")
+while IFS= read -r -d '' file; do
+    if ! file_bytes=$(wc -c < "$file"); then
+        rm -f -- "$scan_list"
+        echo "Ошибка: не удалось прочитать файл: $file" >&2
+        exit 1
     fi
-done
+    total_bytes=$((total_bytes + file_bytes))
+    files+=("$file")
+    sizes+=("$file_bytes")
+done < "$scan_list"
+rm -f -- "$scan_list"
 
 percent=$((total_bytes * 100 / limit_bytes))
 
@@ -126,7 +140,7 @@ if (( total_bytes * 100 > threshold * limit_bytes )); then
     archive_file="$archive_temp$archive_extension"
     selected_names=()
     for file in "${selected_files[@]}"; do
-        selected_names+=("${file##*/}")
+        selected_names+=("${file#"$log_dir"/}")
     done
 
     # Пока tar не завершился успешно и архив не прочитан, исходники не трогаем.
