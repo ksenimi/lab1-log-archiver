@@ -64,14 +64,12 @@ get_log_size_bytes() {
     local file
     local size
 
-    shopt -s nullglob dotglob
-
-    for file in "$LOG_DIR"/*; do
+    while IFS= read -r -d '' file; do
         if [[ -f "$file" && ! -L "$file" ]]; then
             size=$(wc -c < "$file") || return 1
             total=$((total + size))
         fi
-    done
+    done < <(find "$LOG_DIR" -type f -print0)
 
     echo "$total"
 }
@@ -418,6 +416,74 @@ else
         else
             fail_test "LZMA-архив не создан или работает неправильно"
         fi
+    fi
+fi
+
+
+# ==================================================
+# ТЕСТ 7
+# Файлы во вложенных папках
+# ==================================================
+
+echo
+echo "Тест 7: обработка вложенных папок"
+
+if ! create_test_environment; then
+    fail_test "не удалось подготовить тестовую среду"
+else
+    # Создаём вложенную структуру каталогов.
+    mkdir -p "$LOG_DIR/folder1/folder2" "$LOG_DIR/folder3"
+
+    # Создаём файлы общим размером 600 МиБ.
+    create_file "$LOG_DIR/root.log" 100
+    create_file "$LOG_DIR/folder1/old.log" 100
+    create_file "$LOG_DIR/folder1/folder2/middle.log" 100
+    create_file "$LOG_DIR/folder3/new.log" 300
+
+    # Назначаем даты изменения.
+    touch -d "2020-01-01 10:00:00" "$LOG_DIR/folder1/old.log"
+    touch -d "2021-01-01 10:00:00" "$LOG_DIR/folder1/folder2/middle.log"
+    touch -d "2024-01-01 10:00:00" "$LOG_DIR/root.log"
+    touch -d "2023-01-01 10:00:00" "$LOG_DIR/folder3/new.log"
+
+    THRESHOLD=70
+    TARGET_BYTES=$((THRESHOLD * LIMIT_BYTES / 100))
+
+    echo "Запускаем основной скрипт для вложенных папок..."
+
+    if bash "$ARCHIVER" "$LOG_DIR" "$BACKUP_DIR" "$THRESHOLD" "$LIMIT_MIB"; then
+        RESULT=0
+    else
+        RESULT=$?
+    fi
+
+    ARCHIVE="$(get_single_gz_archive)"
+    LOG_SIZE="$(get_log_size_bytes)"
+
+    # Если архив найден, получаем список его файлов.
+    ARCHIVE_LIST=""
+    if [ -n "$ARCHIVE" ]; then
+        ARCHIVE_LIST="$(tar -tzf "$ARCHIVE" 2>/dev/null)"
+    fi
+
+    # Проверяем, что архив содержит два самых старых файла.
+    if [ -n "$ARCHIVE" ] &&
+       [ "$RESULT" -eq 0 ] &&
+       printf '%s\n' "$ARCHIVE_LIST" | grep -Fxq "folder1/old.log" &&
+       printf '%s\n' "$ARCHIVE_LIST" | grep -Fxq "folder1/folder2/middle.log" &&
+       ! printf '%s\n' "$ARCHIVE_LIST" | grep -Fxq "root.log" &&
+       ! printf '%s\n' "$ARCHIVE_LIST" | grep -Fxq "folder3/new.log" &&
+       [ ! -f "$LOG_DIR/folder1/old.log" ] &&
+       [ ! -f "$LOG_DIR/folder1/folder2/middle.log" ] &&
+       [ -f "$LOG_DIR/root.log" ] &&
+       [ -f "$LOG_DIR/folder3/new.log" ] &&
+       [ "$LOG_SIZE" -eq $((400 * 1024 * 1024)) ] &&
+       [ "$LOG_SIZE" -le "$TARGET_BYTES" ]; then
+
+        pass_test "вложенные папки обрабатываются, самые старые файлы архивируются с сохранением путей"
+    else
+        fail_test "обработка вложенных папок работает неправильно"
+
     fi
 fi
 
