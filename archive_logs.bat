@@ -1,28 +1,16 @@
 @echo off
-setlocal
+setlocal EnableExtensions DisableDelayedExpansion
+chcp 1251 >nul
 
-if "%~1"=="" (
-    echo Error: specify the log folder.
-    exit /b 2
-)
+rem Аргументы: папка логов, папка архивов, порог в %, лимит в МиБ.
+if "%~1"=="" goto bad_args
+if "%~2"=="" goto bad_args
+if "%~3"=="" goto bad_args
+if "%~4"=="" goto bad_args
+if not "%~5"=="" goto bad_args
 
 if not exist "%~1\." (
     echo Error: the log folder does not exist.
-    exit /b 2
-)
-
-if "%~2"=="" (
-    echo Error: specify the backup folder.
-    exit /b 2
-)
-
-if "%~3"=="" (
-    echo Error: specify the threshold.
-    exit /b 2
-)
-
-if "%~4"=="" (
-    echo Error: specify the limit in MiB.
     exit /b 2
 )
 
@@ -31,66 +19,178 @@ if errorlevel 1 (
     echo Error: threshold must be an integer from 0 to 100.
     exit /b 2
 )
-echo(%~4| findstr /R /C:"^[0-9]*[1-9][0-9]*$" >nul
+
+echo(%~4| findstr /R /C:"^[1-9][0-9]*$" >nul
 if errorlevel 1 (
     echo Error: limit must be a positive integer in MiB.
     exit /b 2
 )
+
 for %%D in ("%~1") do set "LOG_DIR=%%~fD"
 for %%D in ("%~2") do set "BACKUP_DIR=%%~fD"
-if /I "%LOG_DIR%"=="%BACKUP_DIR%" (
-    echo Error: backup folder must be outside the log folder.
-    exit /b 2
-)
-powershell -NoProfile -Command "$p=($env:LOG_DIR).TrimEnd('\') + '\'; if (($env:BACKUP_DIR).StartsWith($p, [StringComparison]::OrdinalIgnoreCase)) { exit 2 }"
-if errorlevel 1 (
-    echo Error: backup folder must be outside the log folder.
-    exit /b 2
-)
-set "LIMIT_MIB=%~4"
 set "THRESHOLD=%~3"
-powershell -NoProfile -Command "try { $sum=[bigint]0; foreach ($f in Get-ChildItem -LiteralPath $env:LOG_DIR -Force -File -ErrorAction Stop) { if (-not ($f.Attributes -band [IO.FileAttributes]::ReparsePoint)) { $sum += [bigint]$f.Length } }; $limit=[bigint]$env:LIMIT_MIB * 1048576; $pct=[math]::Round([double]$sum * 100 / [double]$limit, 2); Write-Output ('Folder size: {0} bytes' -f $sum); Write-Output ('Occupancy: {0}%%' -f $pct); if ($sum * 100 -gt [bigint]$env:THRESHOLD * $limit) { exit 3 } else { exit 0 } } catch { Write-Error $_; exit 1 }"
-set "CHECK_RESULT=%errorlevel%"
-if "%CHECK_RESULT%"=="0" (
-    echo Threshold not exceeded. No archive created.
-    exit /b 0
-)
-if not "%CHECK_RESULT%"=="3" (
-    echo Error: could not calculate folder size.
-    exit /b 1
-)
-echo Threshold exceeded. Files selected for archive:
-powershell -NoProfile -Command "try { $files=@(Get-ChildItem -LiteralPath $env:LOG_DIR -Force -File -ErrorAction Stop | Where-Object { -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } | Sort-Object LastWriteTime, Name); $remaining=[bigint]0; foreach ($f in $files) { $remaining += [bigint]$f.Length }; $target=[bigint]$env:THRESHOLD * [bigint]$env:LIMIT_MIB * 1048576; foreach ($f in $files) { if ($remaining * 100 -le $target) { break }; Write-Output ('Selected: {0} ({1} bytes)' -f $f.Name, $f.Length); $remaining -= [bigint]$f.Length }; Write-Output ('Projected remaining after archive: {0} bytes' -f $remaining) } catch { Write-Error $_; exit 1 }"
-if errorlevel 1 (
-    echo Error: could not list log files.
-    exit /b 1
-)
-if not exist "%BACKUP_DIR%\" (
+set "LIMIT_MIB=%~4"
+
+if /I "%LOG_DIR%"=="%BACKUP_DIR%" goto bad_backup
+powershell -NoProfile -Command "$p=($env:LOG_DIR).TrimEnd('\') + '\'; if (($env:BACKUP_DIR).StartsWith($p, [StringComparison]::OrdinalIgnoreCase)) { exit 2 }"
+if errorlevel 1 goto bad_backup
+
+rem Временные списки нужны для сортировки и передачи имён программе tar.
+:choose_work_name
+set "WORK=%TEMP%\lab1_%RANDOM%_%RANDOM%"
+set "CATALOG=%WORK%.txt"
+if exist "%CATALOG%" goto choose_work_name
+set "SORTED=%WORK%.sorted"
+set "SELECTED=%WORK%.selected"
+
+type nul > "%CATALOG%"
+if errorlevel 1 goto work_error
+type nul > "%SELECTED%"
+if errorlevel 1 goto work_error
+
+set "TOTAL_MIB=0"
+set "TOTAL_REM=0"
+
+rem /S обходит подпапки. В список попадают только файлы.
+for /f "tokens=1-3,*" %%A in ('forfiles /P "%LOG_DIR%" /S /C "cmd /c if @isdir==FALSE echo @fdate @ftime @fsize @relpath" 2^>nul') do call :add_file "%%A" "%%B" "%%C" "%%~D"
+
+rem Сравниваем размер с порогом без округления до целых МиБ.
+set /a "TARGET100=LIMIT_MIB*THRESHOLD"
+set /a "TARGET_MIB=TARGET100/100"
+set /a "TARGET_REM=(TARGET100-TARGET_MIB*100)*1048576/100"
+set /a "PERCENT=(TOTAL_MIB*100+TOTAL_REM*100/1048576)/LIMIT_MIB"
+
+echo Folder size: %TOTAL_MIB% MiB and %TOTAL_REM% bytes.
+echo Occupancy: %PERCENT%%%
+
+if %TOTAL_MIB% LSS %TARGET_MIB% goto no_archive
+if %TOTAL_MIB% EQU %TARGET_MIB% if %TOTAL_REM% LEQ %TARGET_REM% goto no_archive
+
+rem Дата записана в начале строки как ГГГГММДДЧЧММСС.
+rem Поэтому sort ставит самые старые файлы первыми.
+sort "%CATALOG%" /O "%SORTED%"
+if errorlevel 1 goto work_error
+
+set "NEED_FILES=1"
+for /f "usebackq tokens=1,2,3 delims=|" %%A in ("%SORTED%") do call :select_file "%%B" "%%C"
+if not exist "%BACKUP_DIR%\." (
     mkdir "%BACKUP_DIR%"
-    if errorlevel 1 (
-        echo Error: could not create backup folder.
-        exit /b 1
-    )
+    if errorlevel 1 goto backup_error
 )
-set "ARCHIVE_EXT=.tar.gz"
-if "%LAB1_MAX_COMPRESSION%"=="1" set "ARCHIVE_EXT=.tar.lzma"
+
+set "COMPRESS=-z"
+set "EXT=.tar.gz"
+if "%LAB1_MAX_COMPRESSION%"=="1" (
+    set "COMPRESS=--lzma"
+    set "EXT=.tar.lzma"
+)
+
 :choose_archive_name
-set "ARCHIVE_PATH="
-for /f %%G in ('powershell -NoProfile -Command "[guid]::NewGuid().ToString('N')"') do set "ARCHIVE_PATH=%BACKUP_DIR%\logs_%%G%ARCHIVE_EXT%"
-if not defined ARCHIVE_PATH (
-    echo Error: could not create an archive name.
-    exit /b 1
+set "ARCHIVE=%BACKUP_DIR%\logs_%RANDOM%_%RANDOM%%EXT%"
+if exist "%ARCHIVE%" goto choose_archive_name
+
+rem Все выбранные файлы попадают в один архив.
+tar -c %COMPRESS% -f "%ARCHIVE%" -C "%LOG_DIR%" -T "%SELECTED%"
+if errorlevel 1 goto archive_error
+tar -t %COMPRESS% -f "%ARCHIVE%" >nul
+if errorlevel 1 goto archive_error
+
+rem Исходные файлы удаляются только после проверки архива.
+for /f "usebackq delims=" %%F in ("%SELECTED%") do (
+    del /f /q /a "%LOG_DIR%\%%F" >nul 2>&1
+    if exist "%LOG_DIR%\%%F" goto delete_error
 )
-if exist "%ARCHIVE_PATH%" goto choose_archive_name
-echo Archive path: "%ARCHIVE_PATH%"
-powershell -NoProfile -Command "try { $archiveReady=$false; $files=@(Get-ChildItem -LiteralPath $env:LOG_DIR -Force -File -ErrorAction Stop | Where-Object { -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } | Sort-Object LastWriteTime, Name); $remaining=[bigint]0; foreach ($f in $files) { $remaining += [bigint]$f.Length }; $target=[bigint]$env:THRESHOLD * [bigint]$env:LIMIT_MIB * 1048576; $selected=New-Object 'System.Collections.Generic.List[System.IO.FileInfo]'; foreach ($f in $files) { if ($remaining * 100 -le $target) { break }; [void]$selected.Add($f); $remaining -= [bigint]$f.Length }; if ($selected.Count -eq 0) { throw 'No files selected' }; $names=[string[]]@($selected | ForEach-Object { $_.Name }); if ($env:LAB1_MAX_COMPRESSION -eq '1') { & tar.exe --lzma -cf $env:ARCHIVE_PATH -C $env:LOG_DIR -- @names } else { & tar.exe -czf $env:ARCHIVE_PATH -C $env:LOG_DIR -- @names }; if ($LASTEXITCODE -ne 0) { throw ('tar failed with code {0}' -f $LASTEXITCODE) }; $archive=Get-Item -LiteralPath $env:ARCHIVE_PATH -ErrorAction Stop; if ($archive.Length -eq 0) { throw 'Archive is empty' }; & tar.exe -tf $env:ARCHIVE_PATH | Out-Null; if ($LASTEXITCODE -ne 0) { throw 'Archive cannot be read' }; $archiveReady=$true; Write-Output ('Archive created and checked: {0}' -f $env:ARCHIVE_PATH); foreach ($f in $selected) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; Write-Output ('Deleted: {0}' -f $f.Name) } } catch { if (-not $archiveReady -and (Test-Path -LiteralPath $env:ARCHIVE_PATH)) { Remove-Item -LiteralPath $env:ARCHIVE_PATH -Force -ErrorAction SilentlyContinue }; Write-Error $_; exit 1 }"
-if errorlevel 1 (
-    echo Error: archiving failed.
-    exit /b 1
-)
-echo Log folder: "%LOG_DIR%"
-echo Backup folder: "%BACKUP_DIR%"
-echo Threshold: %~3%%
-echo Limit: %~4 MiB
-echo Archive complete.
+
+echo Archive complete: "%ARCHIVE%"
+call :cleanup
 exit /b 0
+
+:no_archive
+echo Threshold not exceeded. No archive created.
+call :cleanup
+exit /b 0
+
+:bad_args
+echo Usage: archive_logs.bat LOG_FOLDER BACKUP_FOLDER THRESHOLD LIMIT_MIB
+exit /b 2
+
+:bad_backup
+echo Error: backup folder must be outside the log folder.
+exit /b 2
+
+:work_error
+echo Error: could not prepare the file lists.
+call :cleanup
+exit /b 1
+
+:backup_error
+echo Error: could not create the backup folder.
+call :cleanup
+exit /b 1
+
+:archive_error
+echo Error: archive could not be created or read. Original files remain.
+if exist "%ARCHIVE%" del /q "%ARCHIVE%" >nul
+call :cleanup
+exit /b 1
+
+:delete_error
+echo Error: archive exists, but an original file could not be deleted.
+call :cleanup
+exit /b 1
+
+:cleanup
+if exist "%CATALOG%" del /q "%CATALOG%" >nul
+if exist "%SORTED%" del /q "%SORTED%" >nul
+if exist "%SELECTED%" del /q "%SELECTED%" >nul
+exit /b 0
+
+:add_file
+set "FILE_DATE=%~1"
+set "FILE_TIME=%~2"
+set "FILE_SIZE=%~3"
+set "REL_PATH=%~4"
+
+rem Превращаем ДД.ММ.ГГГГ в ГГГГММДД для сортировки.
+set "KEY=%FILE_DATE:~6,4%%FILE_DATE:~3,2%%FILE_DATE:~0,2%%FILE_TIME:~0,2%%FILE_TIME:~3,2%%FILE_TIME:~6,2%"
+>> "%CATALOG%" <nul set /p "=%KEY%|%REL_PATH%|%FILE_SIZE%"
+>> "%CATALOG%" echo(
+
+call :split_size "%FILE_SIZE%"
+set /a "TOTAL_MIB+=FILE_MIB, TOTAL_REM+=FILE_REM"
+if %TOTAL_REM% GEQ 1048576 set /a "TOTAL_MIB+=1, TOTAL_REM-=1048576"
+exit /b 0
+
+:select_file
+if "%NEED_FILES%"=="0" exit /b 0
+set "REL_PATH=%~1"
+set "REL_PATH=%REL_PATH:~2%"
+
+rem В списке tar храним путь относительно папки логов.
+>> "%SELECTED%" <nul set /p "=%REL_PATH%"
+>> "%SELECTED%" echo(
+
+call :split_size "%~2"
+set /a "TOTAL_MIB-=FILE_MIB, TOTAL_REM-=FILE_REM"
+if %TOTAL_REM% LSS 0 set /a "TOTAL_MIB-=1, TOTAL_REM+=1048576"
+
+if %TOTAL_MIB% LSS %TARGET_MIB% set "NEED_FILES=0"
+if %TOTAL_MIB% EQU %TARGET_MIB% if %TOTAL_REM% LEQ %TARGET_REM% set "NEED_FILES=0"
+exit /b 0
+
+:split_size
+rem Разбираем размер по цифрам, чтобы не переполнить арифметику cmd
+rem при чтении файла размером более 2 ГиБ.
+set "DIGITS=%~1"
+set "FILE_MIB=0"
+set "FILE_REM=0"
+
+:next_digit
+if not defined DIGITS exit /b 0
+set "DIGIT=%DIGITS:~0,1%"
+set /a "NEXT=FILE_REM*10+DIGIT"
+set /a "PART=NEXT/1048576"
+set /a "FILE_MIB=FILE_MIB*10+PART"
+set /a "FILE_REM=NEXT-PART*1048576"
+set "DIGITS=%DIGITS:~1%"
+goto next_digit
